@@ -1,62 +1,20 @@
-import mimetypes
 import os
-import tempfile
 from pathlib import Path
 
 import click
-import oxipng
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+
+from compression import WebPCompressor
+from gemini import (
+    AspectRatio,
+    GenerationConfig,
+    GeminiImageGenerator,
+    Resolution,
+    ThinkingLevel,
+)
 
 
-load_dotenv(Path(".env/.env"))
-
-
-def save_binary_file(file_name: str, data: bytes) -> None:
-    with open(file_name, "wb") as f:
-        f.write(data)
-
-    if file_name.lower().endswith(".png"):
-        try:
-            oxipng.optimize(file_name, level=6)
-        except Exception:
-            pass
-
-    file_size = os.path.getsize(file_name)
-    size_mb = file_size / 1024 / 1024
-    click.echo(f"Saved: {file_name} ({size_mb:.1f}MB)")
-
-
-def upload_image(client: genai.Client, image_path: str) -> types.File:
-    file_ext = Path(image_path).suffix.lower()
-
-    if file_ext == ".png":
-        click.echo(f"Compressing: {image_path}")
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_path = tmp.name
-
-        try:
-            import shutil
-
-            shutil.copy2(image_path, tmp_path)
-            oxipng.optimize(tmp_path, level=6)
-            compressed_size = os.path.getsize(tmp_path)
-            original_size = os.path.getsize(image_path)
-            saved_pct = (1 - compressed_size / original_size) * 100
-            click.echo(f"Compressed: {saved_pct:.1f}% smaller")
-
-            click.echo(f"Uploading: {image_path}")
-            uploaded_file = client.files.upload(file=tmp_path)
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-    else:
-        click.echo(f"Uploading: {image_path}")
-        uploaded_file = client.files.upload(file=image_path)
-
-    return uploaded_file
+load_dotenv(Path(".env.local"))
 
 
 @click.command()
@@ -71,24 +29,34 @@ def upload_image(client: genai.Client, image_path: str) -> types.File:
 )
 @click.option(
     "--thinking-level",
-    type=click.Choice(["LOW", "MEDIUM", "HIGH"], case_sensitive=True),
-    default="HIGH",
+    type=click.Choice(["minimal", "high"], case_sensitive=False),
+    default="high",
     show_default=True,
     help="Thinking level for generation",
 )
 @click.option(
     "--aspect-ratio",
-    type=click.Choice(["1:1", "16:9", "9:16", "4:3", "3:4"], case_sensitive=False),
+    type=click.Choice(
+        ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"],
+        case_sensitive=False,
+    ),
     default="1:1",
     show_default=True,
     help="Output image aspect ratio",
 )
 @click.option(
     "--resolution",
-    type=click.Choice(["256", "512", "1024", "2K"], case_sensitive=False),
+    type=click.Choice(["512", "1K", "2K", "4K"], case_sensitive=False),
     default="2K",
     show_default=True,
     help="Output image resolution",
+)
+@click.option(
+    "--temperature",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Temperature for generation (0.0-2.0)",
 )
 @click.option(
     "--output",
@@ -103,75 +71,49 @@ def generate(
     thinking_level: str,
     aspect_ratio: str,
     resolution: str,
+    temperature: float,
     output: str,
 ):
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise click.ClickException("GEMINI_API_KEY not found in .env/.env")
+    """Generate images using Gemini API."""
+    try:
+        generator = GeminiImageGenerator()
+    except ValueError as e:
+        raise click.ClickException(str(e))
 
-    client = genai.Client(api_key=api_key)
-
-    model = "gemini-3.1-flash-image-preview"
-
-    parts = []
-
-    for image_path in images:
-        uploaded_file = upload_image(client, image_path)
-        parts.append(
-            types.Part.from_uri(
-                file_uri=uploaded_file.uri, mime_type=uploaded_file.mime_type
-            )
-        )
-
-    parts.append(types.Part.from_text(text=prompt))
-
-    contents = [
-        types.Content(
-            role="user",
-            parts=parts,
-        ),
-    ]
-
-    generate_content_config = types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(
-            thinking_level=thinking_level,
-        ),
-        image_config=types.ImageConfig(
-            aspect_ratio=aspect_ratio,
-            image_size=resolution,
-        ),
-        response_modalities=[
-            "IMAGE",
-            "TEXT",
-        ],
+    config = GenerationConfig(
+        aspect_ratio=AspectRatio(aspect_ratio),
+        resolution=Resolution(resolution),
+        thinking_level=ThinkingLevel(thinking_level.lower()),
+        temperature=temperature,
     )
+
+    if images:
+        click.echo(f"Processing {len(images)} input image(s)...")
 
     click.echo("Generating...")
 
-    file_index = 0
-    for chunk in client.models.generate_content_stream(
-        model=model,
-        contents=contents,
-        config=generate_content_config,
-    ):
-        if chunk.parts is None:
-            continue
+    result = generator.generate(
+        prompt=prompt,
+        images=list(images),
+        config=config,
+    )
 
-        for part in chunk.parts:
-            if part.inline_data and part.inline_data.data:
-                file_extension = (
-                    mimetypes.guess_extension(part.inline_data.mime_type) or ".png"
-                )
-                file_name = f"{output}_{file_index}{file_extension}"
-                file_index += 1
-                save_binary_file(file_name, part.inline_data.data)
-            elif part.text:
-                click.echo(part.text, nl=False)
+    compressor = WebPCompressor()
 
-    if file_index == 0:
+    for img in result.images:
+        file_name = f"{output}_{img.index}"
+        webp_path = compressor.convert_bytes(img.data, file_name)
+        file_size = os.path.getsize(webp_path)
+        size_kb = file_size / 1024
+        click.echo(f"Saved: {webp_path} ({size_kb:.1f}KB)")
+
+    if result.text:
+        click.echo(result.text)
+
+    if not result.images:
         click.echo("No images generated.")
 
-    click.echo("\nDone!")
+    click.echo("Done!")
 
 
 if __name__ == "__main__":
